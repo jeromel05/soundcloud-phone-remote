@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# local backup copy; the git history has the earlier version
+versions/
