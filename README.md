@@ -1,6 +1,6 @@
 # SoundCloud phone remote
 
-Control SoundCloud playing on your Mac from your phone, Spotify-Connect style.
+Control SoundCloud (and movies in VLC) on your Mac from your phone, Spotify-Connect style.
 A small Python web server on the Mac serves a remote-control page; open it on
 your phone (same Wi-Fi) by scanning the QR code printed in the terminal.
 
@@ -8,8 +8,12 @@ your phone (same Wi-Fi) by scanning the QR code printed in the terminal.
 - Play/pause, next, previous, Mac volume
 - With the userscript: SoundCloud's **Next up** queue (tap a track to play it),
   tap/drag to seek, and like/unlike
-- **Stop remote** button: pauses the music and shuts the server down, so the Mac
-  can go to sleep
+- **VLC**: movie title, seekable progress bar, −10 s / +10 s, play/pause, fullscreen
+- **Switch players**: when SoundCloud and VLC are both open, tap SoundCloud | VLC
+  at the top, e.g. to pause the movie and start music. The phone also follows
+  whichever player you start on the Mac.
+- **Stop remote** button: pauses whatever is playing and shuts the server down,
+  so the Mac can go to sleep
 
 ## Setup
 
@@ -54,7 +58,11 @@ keys, and "Now playing" comes from macOS's system-wide Now Playing info, the
 same data Control Center shows. Media keys need Accessibility permission for
 your terminal app (System Settings → Privacy & Security → Accessibility).
 
-The server switches between modes automatically.
+**VLC** is controlled over AppleScript; nothing to install. The first time,
+macOS asks whether your terminal may control VLC: allow it. The remote never
+launches VLC itself; it only shows up once VLC has something open.
+
+The server switches between all of these automatically.
 
 ## Security
 
@@ -68,3 +76,6 @@ The server switches between modes automatically.
 - The userscript depends on SoundCloud's internal (undocumented) code. A
   SoundCloud update can break it; the remote then falls back to basic mode.
 - Basic mode uses macOS's private MediaRemote framework, which Apple may change.
+- VLC's scripting doesn't expose its playlist, so movies get no "Up next" list.
+- Headphones with wear detection (AirPods, Sennheiser Smart Pause, ...) pause
+  anything that starts while they're not being worn.
