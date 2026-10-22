@@ -33,7 +33,12 @@ caffeinate -i ~/.sc-remote/bin/python remote_sc.py
 
 Scan the QR code with your phone. Tip: "Add to Home Screen" for an app-like
 remote. The link contains an access token, saved in `~/.sc_remote_token`, so the
-bookmark keeps working across restarts.
+bookmark keeps working across restarts. Give the Mac a fixed address in your
+router so the link never changes; if it does change, the terminal prints the new one.
+
+Closing the lid still puts the Mac to sleep (`caffeinate -i` only blocks idle
+sleep). The phone shows "Can't reach the Mac" meanwhile and reconnects by itself
+after wake-up.
 
 ### Userscript (recommended)
 
@@ -70,6 +75,8 @@ The server switches between all of these automatically.
 - The userscript endpoints accept only connections from the Mac itself carrying
   a custom header, so other devices and ordinary web pages can't use them.
 - Plain HTTP on your local network. Intended for a trusted home Wi-Fi.
+- With a VPN on, allow local network (LAN) connections in the VPN app, or the
+  phone can't reach the Mac.
 
 ## Caveats
 

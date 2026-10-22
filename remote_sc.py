@@ -55,6 +55,7 @@ import json
 import re
 import secrets
 import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -467,11 +468,12 @@ PAGE = """<!doctype html><html><head>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="SC Remote">
 <meta name="theme-color" content="#0a2a40">
+<meta name="color-scheme" content="dark">
 <title>SC Remote</title>
 <style>
 /* Frutiger Aero-ish: deep aqua sky, frosted glass, glossy orbs. The accent
    follows the player: SoundCloud orange, VLC turquoise. */
-:root{--fg:#f4fbff;--mut:rgba(214,236,250,.66);--acc:#ff5500;--acc2:#ffa45c;
+:root{color-scheme:dark;--fg:#f4fbff;--mut:rgba(214,236,250,.66);--acc:#ff5500;--acc2:#ffa45c;
   --glass:rgba(255,255,255,.09);--edge:rgba(255,255,255,.24);--sky:#0a2a40}
 body.vlc{--acc:#13c4bd;--acc2:#8af4ec}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -696,11 +698,14 @@ function show(s){
   $('err').textContent = s.error || '';
 }
 async function call(path, opts, params){
+  // give up after 5s: a sleeping Mac never answers, and hung requests would pile up
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 5000);
   try {
-    const r = await fetch(path + '?t=' + encodeURIComponent(T) + (params ? '&' + params : ''), opts);
+    const r = await fetch(path + '?t=' + encodeURIComponent(T) + (params ? '&' + params : ''), Object.assign({signal: ctl.signal}, opts));
     if (r.status === 403) return $('err').textContent = 'Bad link - rescan the QR code';
-    show(await r.json());
-  } catch(e){ $('err').textContent = 'Mac not reachable'; }
+    show(await r.json());  // clears the message below once the Mac is back
+  } catch(e){ $('err').textContent = 'Can\u2019t reach the Mac (asleep?) \u00b7 retrying\u2026'; }
+  finally { clearTimeout(timer); }
 }
 function renderSources(list, cur){
   const key = JSON.stringify([cur, list]);
@@ -746,7 +751,8 @@ $('prog').addEventListener('pointerup', e => {
 $('prog').addEventListener('pointercancel', () => { dragging = null; tick(); });
 
 let stopped = false;
-const poll = () => { if (!stopped) call('/api/status'); };
+let polling = false;
+const poll = async () => { if (stopped || polling) return; polling = true; await call('/api/status'); polling = false; };
 poll(); setInterval(poll, 3000); setInterval(tick, 500);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 async function stopRemote(){
@@ -899,7 +905,36 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep the terminal quiet
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self):
+        # HTTPServer would look up this Mac's name via reverse DNS here, which can
+        # hang for ~30s when offline or just after waking. We never use the name.
+        socketserver.TCPServer.server_bind(self)
+        host, self.server_port = self.server_address[:2]
+        self.server_name = str(host)
+
+    def handle_error(self, request, client_address):
+        # A phone locking its screen, a tab closing, or the Mac sleeping mid-request
+        # just drops the connection. That's normal, not worth a traceback.
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError, socket.timeout)):
+            return
+        super().handle_error(request, client_address)
+
+
 def lan_ip() -> str:
+    """This Mac's address on the home network. Ask the Wi-Fi/Ethernet ports (en0,
+    en1, ...) directly: with a VPN on, the default route goes through the tunnel,
+    whose address the phone can't reach."""
+    for i in range(8):
+        try:
+            ip = subprocess.run(["ipconfig", "getifaddr", f"en{i}"],
+                                capture_output=True, text=True, timeout=2).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            ip = ""
+        if ip and not ip.startswith("169.254."):  # skip self-assigned addresses
+            return ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("10.255.255.255", 1))  # no packet is sent
@@ -910,26 +945,9 @@ def lan_ip() -> str:
         s.close()
 
 
-def main():
-    if not AXIsProcessTrusted():
-        print("!  Your terminal lacks Accessibility permission - media keys (basic mode) won't work.\n"
-              "   System Settings > Privacy & Security > Accessibility, enable it, then restart.\n")
-
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    except OSError as e:
-        sys.exit(f"Can't listen on port {PORT} ({e.strerror}). Is the remote already running?")
-
-    host = socket.gethostname()
-    if not host.endswith(".local"):
-        host += ".local"
-    url = f"http://{lan_ip()}:{PORT}/?t={TOKEN}"
-
-    print("SoundCloud remote running.\n")
-    print(f"  Open on your phone:  {url}")
-    print(f"  Or (survives IP changes): http://{host}:{PORT}/?t={TOKEN}")
-    print(f"  Userscript for full mode (open in your browser on this Mac):\n"
-          f"    http://127.0.0.1:{PORT}/sc-remote.user.js\n")
+def print_link(ip: str) -> None:
+    url = f"http://{ip}:{PORT}/?t={TOKEN}"
+    print(f"  Open on your phone:  {url}\n")
     try:
         import qrcode
         qr = qrcode.QRCode(border=1)
@@ -937,7 +955,43 @@ def main():
         qr.print_ascii(invert=True)
     except ImportError:
         pass
+
+
+def watch_ip() -> None:
+    """A laptop can wake up with a new address (other Wi-Fi, new DHCP lease);
+    the phone's link then stops working, so print the new one."""
+    last = lan_ip()
+    while True:
+        time.sleep(15)
+        ip = lan_ip()
+        if ip == "127.0.0.1":  # offline / asleep: wait for the network
+            continue
+        if ip != last:
+            print(f"\nThis Mac's network address changed ({last} -> {ip}). New link:", flush=True)
+            print_link(ip)
+            sys.stdout.flush()
+        last = ip
+
+
+def main():
+    if not AXIsProcessTrusted():
+        print("!  Your terminal lacks Accessibility permission - media keys (basic mode) won't work.\n"
+              "   System Settings > Privacy & Security > Accessibility, enable it, then restart.\n")
+
+    try:
+        server = Server(("0.0.0.0", PORT), Handler)
+    except OSError as e:
+        sys.exit(f"Can't listen on port {PORT} ({e.strerror}). Is the remote already running?")
+
+    print("SoundCloud remote running.\n")
+    print_link(lan_ip())
+    print(f"  Userscript for full mode (open in your browser on this Mac):\n"
+          f"    http://127.0.0.1:{PORT}/sc-remote.user.js\n"
+          f"  Tip: give this Mac a fixed address in your router (FRITZ!Box: Home Network >\n"
+          f"  Network > this Mac > Always assign this network device the same IPv4 address)\n"
+          f"  so the phone link keeps working.\n")
     print('Ctrl+C (or "Stop remote" on the phone) to stop.')
+    threading.Thread(target=watch_ip, daemon=True).start()
 
     try:
         server.serve_forever()  # returns when the phone asks to stop
