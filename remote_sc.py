@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-remote_sc.py - control SoundCloud (and VLC) on your Mac from your phone, Spotify-Connect style.
+remote_sc.py - control SoundCloud, Bandcamp and VLC on your Mac from your phone, Spotify-Connect style.
 
 How it works
   A tiny web server on your Mac serves a remote-control page. Two modes:
 
   Full mode (with the sc_remote.user.js userscript in your browser)
-    The userscript talks to SoundCloud's own player inside the tab, so the
-    phone gets the cover, the "Next up" queue (tap a track to play it),
-    seeking (tap/drag the progress bar) and the like button.
+    The userscript talks to SoundCloud's / Bandcamp's own player inside the
+    tab, so the phone gets the cover, the queue or album track list (tap a
+    track to play it), seeking (tap/drag the progress bar) and, on SoundCloud,
+    the like button.
 
   Basic mode (no userscript, or no SoundCloud tab open)
     Buttons send macOS media-key events (play/pause, next, previous), which
@@ -34,9 +35,11 @@ Run
 
 Userscript (once, for full mode)
   1. Install the Violentmonkey add-on in your browser (Tampermonkey works too).
+     In Chrome: Tampermonkey, then chrome://extensions > Tampermonkey >
+     Details > Allow User Scripts.
   2. With the remote running, open http://127.0.0.1:8765/sc-remote.user.js
      in that browser on the Mac and click Install.
-  3. Reload any open SoundCloud tabs.
+  3. Reload any open SoundCloud / Bandcamp tabs.
 
 Then scan the QR code / open the printed URL on your phone (same Wi-Fi).
 Tip: "Add to Home Screen" on the phone for an app-like remote. The access
@@ -247,19 +250,27 @@ def system_status() -> dict:
     return s
 
 
-# --- SoundCloud bridge (sc_remote.user.js) -----------------------------------
-# With the userscript installed in the browser, each SoundCloud tab reports its
-# player state here every second and picks up commands from the reply; the
-# active tab also long-polls so taps act instantly. That adds the queue, seeking
-# and liking, and needs no Accessibility permission. Without it (or if the tab
-# goes quiet) everything falls back to media keys + Now Playing.
+# --- browser bridge (sc_remote.user.js): SoundCloud and Bandcamp ---------------
+# With the userscript installed in the browser, each SoundCloud/Bandcamp tab
+# reports its player state here about once a second; we hold each reply until a
+# command for it arrives (or a second passes), so taps act at once. That
+# adds the queue, seeking and liking, and needs no Accessibility permission.
+# Without it (or if the tab goes quiet) everything falls back to media keys +
+# Now Playing.
 USERSCRIPT = Path(__file__).with_name("sc_remote.user.js")
 BRIDGE_STALE = 8          # seconds without a report before a tab counts as gone
-BRIDGE_CMDS = ("playpause", "next", "prev", "seek", "play", "like")
+SITE_CMDS = {"soundcloud": ("playpause", "next", "prev", "seek", "play", "like"),
+             "bandcamp": ("playpause", "next", "prev", "seek", "play")}
+BRIDGE_SITES = tuple(SITE_CMDS)
+BRIDGE_CMDS = tuple({c for cmds in SITE_CMDS.values() for c in cmds})
 tabs = {}                 # tab id -> {"state", "seen", "since", "played", "acked"}
 pending = {}              # tab id -> [command, ...] waiting to be fetched
 bridge = threading.Condition()
 seq = itertools.count(1)
+
+
+def site_of(state: dict) -> str:
+    return state.get("site") if state.get("site") in BRIDGE_SITES else "soundcloud"  # v1 scripts: SoundCloud only
 
 
 def bridge_report(tab: str, state: dict) -> None:
@@ -274,17 +285,18 @@ def bridge_report(tab: str, state: dict) -> None:
         for k in [k for k, v in tabs.items() if now - v["seen"] > 60]:
             tabs.pop(k)
             pending.pop(k, None)
-        note_playing("soundcloud", any(v["state"].get("playing") for v in tabs.values()
-                                       if now - v["seen"] < BRIDGE_STALE))
+        for site in BRIDGE_SITES:
+            note_playing(site, any(v["state"].get("playing") for v in tabs.values()
+                                   if now - v["seen"] < BRIDGE_STALE and site_of(v["state"]) == site))
         bridge.notify_all()
 
 
-def active_tab():
-    """The SoundCloud tab to show and control: the one that played most recently.
+def active_tab(site: str = "soundcloud"):
+    """The site's tab to show and control: the one that played most recently.
     Call with `bridge` held."""
     now = time.time()
     live = [(v["played"], bool(v["state"].get("title")), v["since"], k) for k, v in tabs.items()
-            if now - v["seen"] < BRIDGE_STALE and v["state"].get("ready")]
+            if now - v["seen"] < BRIDGE_STALE and v["state"].get("ready") and site_of(v["state"]) == site]
     return max(live)[-1] if live else None
 
 
@@ -314,10 +326,10 @@ def bridge_status(tab: str) -> dict:
         s, seen = dict(t["state"]), t["seen"]
     if s.get("playing") and s.get("position") is not None:
         s["position"] = min(s.get("duration") or 1e9, s["position"] + time.time() - seen)
-    for k in ("ack", "ready", "error"):
+    for k in ("ack", "ready", "error", "doc", "site"):
         s.pop(k, None)
     s.setdefault("title", "")  # nothing loaded yet
-    s["app"] = "SoundCloud"
+    s["app"] = SOURCE_NAMES[site_of(t["state"])]
     return s
 
 
@@ -391,7 +403,7 @@ def vlc_status(v: dict) -> dict:
 
 
 # --- sources: SoundCloud (userscript), VLC, or whatever macOS says is playing --
-SOURCE_NAMES = {"soundcloud": "SoundCloud", "vlc": "VLC"}
+SOURCE_NAMES = {"soundcloud": "SoundCloud", "bandcamp": "Bandcamp", "vlc": "VLC"}
 focus: dict = {"src": None}  # source shown on the phone; guarded by `bridge`
 was_playing = {}             # source -> playing at last look, to spot (re)starts
 
@@ -403,33 +415,40 @@ def note_playing(src: str, playing) -> None:
     was_playing[src] = bool(playing)
 
 
+def same_title(t) -> str:
+    return re.sub(r"^[\u25B6\u25BA\uFE0E\uFE0F\s]+", "", t or "").strip().lower()  # Chrome prefixes "▶︎" while playing
+
+
 def gather() -> dict:
-    """Look at every source once: {"tab", "vlc", "system", "avail": [...]}."""
+    """Look at every source once: {"tabs", "vlc", "system", "avail": [...], ...}."""
+    now = time.time()
     with bridge:
-        tab = active_tab()
-        sc_playing = bool(tab) and bool(tabs[tab]["state"].get("playing"))
+        site_tabs = {site: active_tab(site) for site in BRIDGE_SITES}
+        site_playing = {site: bool(t) and bool(tabs[t]["state"].get("playing")) for site, t in site_tabs.items()}
+        # what the userscript tabs show, to recognise them again in macOS Now Playing
+        known = {same_title(x) for v in tabs.values() if now - v["seen"] < BRIDGE_STALE
+                 for x in (v["state"].get("title"), v["state"].get("doc")) if x}
     # each osascript call costs ~0.15s, so ask VLC and Now Playing at the same time
     got = {}
     th = threading.Thread(target=lambda: got.update(vlc=vlc()))
     th.start()
-    sysst = system_status() if not tab else None  # no userscript: SoundCloud etc. via Now Playing
+    sysst = system_status()  # anything else that's playing (or SoundCloud without the userscript)
     th.join()
     v = got["vlc"]
     has_vlc = bool(v.get("name"))
-    volume = v.get("volume") if isinstance(v.get("volume"), int) else (sysst or {}).get("volume")
-    if sysst and (sysst.get("app") == "VLC" or not sysst.get("title")):
-        sysst = None  # VLC is covered by its own source
-    avail = [s for s, ok in (("soundcloud", tab), ("vlc", has_vlc), ("system", sysst)) if ok]
+    volume = v.get("volume") if isinstance(v.get("volume"), int) else sysst.get("volume")
+    if sysst.get("app") == "VLC" or not sysst.get("title") or same_title(sysst["title"]) in known:
+        sysst = None  # already covered by VLC's or a userscript tab's own entry
+    avail = [s for s in BRIDGE_SITES if site_tabs[s]]
+    avail += [s for s, ok in (("vlc", has_vlc), ("system", sysst)) if ok]
     with bridge:
-        if tab:
-            note_playing("soundcloud", sc_playing)
         if has_vlc:
             note_playing("vlc", v.get("playing"))
         if sysst:
             note_playing("system", sysst.get("playing"))
-    return {"tab": tab, "vlc": v, "system": sysst, "avail": avail, "volume": volume,
-            "playing": {"soundcloud": sc_playing, "vlc": bool(v.get("playing")),
-                        "system": bool(sysst and sysst.get("playing"))}}
+    return {"tab": site_tabs["soundcloud"], "tabs": site_tabs, "vlc": v, "system": sysst, "avail": avail,
+            "volume": volume, "playing": dict(site_playing, vlc=bool(v.get("playing")),
+                                              system=bool(sysst and sysst.get("playing")))}
 
 
 def chosen_source(g: dict):
@@ -444,8 +463,8 @@ def chosen_source(g: dict):
 def status(g=None) -> dict:
     g = g or gather()
     src = chosen_source(g)
-    if src == "soundcloud":
-        s = bridge_status(g["tab"])
+    if src in BRIDGE_SITES:
+        s = bridge_status(g["tabs"][src])
     elif src == "vlc":
         s = vlc_status(g["vlc"])
     else:
@@ -453,8 +472,8 @@ def status(g=None) -> dict:
         src = "system"
     s["volume"] = g["volume"]
     s["source"] = src
-    s["sources"] = [{"id": x, "playing": g["playing"][x],
-                     "name": SOURCE_NAMES.get(x) or (g["system"] or {}).get("app") or "Now Playing"}
+    other = re.sub(r"^(Google|Microsoft) ", "", (g["system"] or {}).get("app") or "Now Playing")  # short pill: "Chrome"
+    s["sources"] = [{"id": x, "playing": g["playing"][x], "name": SOURCE_NAMES.get(x) or other}
                     for x in g["avail"]]
     return s
 
@@ -476,6 +495,7 @@ PAGE = """<!doctype html><html><head>
 :root{color-scheme:dark;--fg:#f4fbff;--mut:rgba(214,236,250,.66);--acc:#ff5500;--acc2:#ffa45c;
   --glass:rgba(255,255,255,.09);--edge:rgba(255,255,255,.24);--sky:#0a2a40}
 body.vlc{--acc:#13c4bd;--acc2:#8af4ec}
+body.bc{--acc:#3f8cff;--acc2:#a8cbff}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;background:#040d15;color:var(--fg);font:16px -apple-system,system-ui,sans-serif;
   text-shadow:0 1px 2px rgba(0,0,0,.25)}
@@ -490,21 +510,22 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opa
     radial-gradient(circle at 78% 58%,rgba(255,255,255,.07) 0 22px,rgba(255,255,255,.14) 23px,transparent 24px),
     radial-gradient(circle at 8% 70%,rgba(255,255,255,.06) 0 9px,rgba(255,255,255,.14) 10px,transparent 11px),
     radial-gradient(circle at 50% 92%,rgba(255,255,255,.12) 0 2px,transparent 3px)}
-#player{min-height:100svh;display:flex;flex-direction:column;justify-content:center;gap:24px;
-  padding:calc(16px + env(safe-area-inset-top)) 16px 24px}
-#cover,#poster{width:min(64vw,36svh,320px);margin:0 auto;border-radius:14px;border:1px solid var(--edge);
+#player{min-height:100svh;display:flex;flex-direction:column;justify-content:center;gap:clamp(8px,2.1svh,24px);
+  padding:calc(clamp(8px,1.6svh,16px) + env(safe-area-inset-top)) 16px clamp(10px,2svh,24px)}
+#cover,#poster{width:min(64vw,29svh,320px);margin:0 auto;border-radius:14px;border:1px solid var(--edge);
   box-shadow:0 10px 36px rgba(0,0,0,.45),0 0 0 4px rgba(255,255,255,.04);
   -webkit-box-reflect:below 4px linear-gradient(transparent 84%,rgba(255,255,255,.10))}
 #cover{display:block;aspect-ratio:1;object-fit:cover;background:var(--glass)}
 #cover:not([src]){visibility:hidden}
-#np{text-align:center;min-height:5.5em}
-#np small{display:block;color:var(--mut);font-size:12px;letter-spacing:.12em;
-  text-transform:uppercase;margin-bottom:8px}
-#title{font-size:20px;font-weight:600;line-height:1.3;overflow-wrap:anywhere}
+#np{text-align:center;min-height:4.4em}
+#np small{display:block;color:var(--mut);font-size:11px;letter-spacing:.12em;
+  text-transform:uppercase;margin-bottom:4px}
+#title{font-size:20px;font-weight:600;line-height:1.25;overflow-wrap:anywhere;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}  /* at most 2 lines */
 #artist{color:var(--mut);margin-top:4px;min-height:1.2em}
 #prog{max-width:420px;width:100%;margin:0 auto;visibility:hidden;touch-action:none}
 #prog.seek{cursor:pointer}
-#bar{height:5px;border-radius:3px;margin:10px 0;position:relative;background:rgba(255,255,255,.14);
+#bar{height:5px;border-radius:3px;margin:8px 0;position:relative;background:rgba(255,255,255,.14);
   box-shadow:inset 0 1px 2px rgba(0,0,0,.4),0 1px 0 rgba(255,255,255,.08)}
 #prog.seek #bar{height:7px;border-radius:4px}
 #fill{height:100%;width:0;border-radius:inherit;background:linear-gradient(180deg,var(--acc2),var(--acc));
@@ -515,7 +536,7 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opa
 #times{display:flex;justify-content:space-between;color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
 .row{display:flex;justify-content:center;align-items:center;gap:22px}
 button{position:relative;overflow:hidden;border:1px solid var(--edge);border-radius:50%;color:var(--fg);
-  width:72px;height:72px;display:grid;place-items:center;touch-action:manipulation;cursor:pointer;
+  width:min(72px,9.5svh);height:min(72px,9.5svh);display:grid;place-items:center;touch-action:manipulation;cursor:pointer;
   transition:transform .08s,filter .15s;
   background:linear-gradient(180deg,rgba(255,255,255,.20),rgba(255,255,255,.06) 50%,rgba(255,255,255,.03) 51%,rgba(255,255,255,.10));
   box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 6px 18px rgba(0,0,0,.35);
@@ -523,43 +544,47 @@ button{position:relative;overflow:hidden;border:1px solid var(--edge);border-rad
 button:active{transform:scale(.92);filter:brightness(1.3)}
 .row button:not(#like):not(#fs)::before{content:"";position:absolute;left:14%;right:14%;top:5%;height:44%;
   border-radius:50%;background:linear-gradient(180deg,rgba(255,255,255,.55),rgba(255,255,255,0));pointer-events:none}
-button.big{width:96px;height:96px;border-color:rgba(255,255,255,.45);
+button.big{width:min(96px,12.5svh);height:min(96px,12.5svh);border-color:rgba(255,255,255,.45);
   background:radial-gradient(120% 95% at 50% 0%,var(--acc2) 0%,var(--acc) 55%,color-mix(in srgb,var(--acc) 72%,#000) 100%);
   box-shadow:0 10px 30px color-mix(in srgb,var(--acc) 55%,transparent),inset 0 2px 0 rgba(255,255,255,.6),inset 0 -8px 16px rgba(0,0,0,.18)}
 svg{position:relative;width:32px;height:32px;fill:currentColor;filter:drop-shadow(0 1px 1px rgba(0,0,0,.3))}
-.vol button,#like{width:56px;height:56px;font-size:28px;line-height:1}
+.vol button,#like{width:min(56px,7.5svh);height:min(56px,7.5svh);font-size:28px;line-height:1}
 #vol{min-width:56px;text-align:center;color:var(--mut);font-variant-numeric:tabular-nums}
 #like,#fs{display:none;background:none;border:0;box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none;color:var(--mut)}
 #like svg,#fs svg{width:26px;height:26px}
 #like.on{color:var(--acc)}
 #fs.on{color:var(--acc2)}
 .sc #like,.vlc #fs{display:grid}
-.sc .vol::after,.vlc .vol::after{content:"";width:56px}  /* balances the like/fullscreen button */
+.sc .vol::after,.vlc .vol::after{content:"";width:min(56px,7.5svh)}  /* balances the like/fullscreen button */
 #back,#fwd{display:none}
 .vlc #back,.vlc #fwd{display:grid}
 .vlc #prev,.vlc #next{display:none}
 #back svg,#fwd svg{width:36px;height:36px}
-#srcs{display:flex;justify-content:center;gap:8px;flex-wrap:wrap}
+#srcs{display:flex;justify-content:safe center;gap:6px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;margin:0 -16px;padding:2px 16px}
+#srcs::-webkit-scrollbar{display:none}
 #srcs:empty{display:none}
-#srcs button{--c:#4fb3ff;--c2:#a9dcff;width:auto;height:auto;border-radius:999px;padding:8px 16px;font-size:14px;
+#srcs button{--c:#4fb3ff;--c2:#a9dcff;width:auto;height:auto;border-radius:999px;padding:6px 13px;font-size:13px;flex:none;white-space:nowrap;
   color:var(--mut);display:flex;align-items:center;gap:6px}
 #srcs button[data-id=soundcloud]{--c:#ff5500;--c2:#ffa45c}
 #srcs button[data-id=vlc]{--c:#13c4bd;--c2:#8af4ec}
+#srcs button[data-id=bandcamp]{--c:#3f8cff;--c2:#a8cbff}
 #srcs button.on{color:#fff;font-weight:600;border-color:rgba(255,255,255,.45);
   background:linear-gradient(180deg,var(--c2),var(--c) 55%,color-mix(in srgb,var(--c) 80%,#000));
   box-shadow:inset 0 1px 0 rgba(255,255,255,.55),0 4px 16px color-mix(in srgb,var(--c) 45%,transparent)}
 #srcs button.playing::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--c);
   box-shadow:0 0 6px var(--c)}
 #srcs button.on.playing::before{background:#fff;box-shadow:0 0 6px #fff}
+@media (max-width:375px){#srcs{gap:5px}#srcs button{padding:6px 10px;font-size:12.5px}}  /* after the rules it narrows */
 #poster{display:none;aspect-ratio:16/10;place-items:center;color:rgba(255,255,255,.35);
   background:linear-gradient(160deg,rgba(255,255,255,.16),rgba(255,255,255,.04) 55%,color-mix(in srgb,var(--acc) 18%,transparent));
   -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
 #poster svg{width:64px;height:64px}
 .vlc #cover{display:none}
 .vlc #poster{display:grid}
-#err{color:#ff8a80;text-align:center;font-size:14px;min-height:1.2em}
-#hint{color:var(--mut);text-align:center;font-size:13px;margin-top:-12px}
-#stop{width:auto;height:auto;border-radius:999px;padding:8px 18px;margin:0 auto;font-size:13px;color:var(--mut);
+#err{color:#ff8a80;text-align:center;font-size:14px}
+#hint{color:var(--mut);text-align:center;font-size:13px}
+#err:empty,#hint:empty{display:none}
+#stop{width:auto;height:auto;border-radius:999px;padding:6px 16px;margin:0 auto;font-size:12px;color:var(--mut);
   background:rgba(255,255,255,.05);box-shadow:none}
 #stopped{min-height:100svh;display:none;flex-direction:column;justify-content:center;text-align:center;padding:16px}
 #stopped b{font-size:20px}
@@ -571,7 +596,7 @@ body.off #stopped{display:flex}
   box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 10px 30px rgba(0,0,0,.3);
   -webkit-backdrop-filter:blur(18px) saturate(140%);backdrop-filter:blur(18px) saturate(140%)}
 @media (min-width:584px){#upnext{margin-left:auto;margin-right:auto}}
-.sc #upnext{display:block}
+.hasq #upnext{display:block}
 #upnext h2{font-size:13px;color:var(--mut);letter-spacing:.12em;text-transform:uppercase;
   font-weight:600;margin:0 8px 8px}
 #queue{list-style:none;margin:0;padding:0}
@@ -581,7 +606,10 @@ body.off #stopped{display:flex}
 #queue li.past{opacity:.45}
 #queue img{width:44px;height:44px;border-radius:8px;object-fit:cover;flex:none;background:var(--glass);
   border:1px solid rgba(255,255,255,.14)}
-#queue div{min-width:0;flex:1}
+#queue .num{width:44px;height:44px;border-radius:8px;flex:none;display:grid;place-items:center;font-size:15px;
+  color:var(--mut);font-variant-numeric:tabular-nums;background:var(--glass);border:1px solid rgba(255,255,255,.14)}
+#queue li.cur .num{color:var(--acc2)}
+#queue div:not(.num){min-width:0;flex:1}
 #queue b,#queue span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #queue b{font-weight:500}
 #queue li.cur b{color:var(--acc2)}
@@ -626,7 +654,8 @@ const fmt = s => {
   return h ? h + ':' + pad(m) + ':' + pad(s % 60) : m + ':' + pad(s % 60);
 };
 const source = () => track && track.source;           // 'soundcloud' | 'vlc' | 'system'
-const canSeek = () => ['soundcloud', 'vlc'].includes(source());
+const canSeek = () => ['soundcloud', 'bandcamp', 'vlc'].includes(source());
+const hasQueue = () => ['soundcloud', 'bandcamp'].includes(source());
 let srcsKey;
 const safeImg = u => typeof u === 'string' && (u.startsWith('https://') || u.startsWith('/api/art')) ? u : '';
 
@@ -653,8 +682,13 @@ function renderQueue(s){
     const li = document.createElement('li');
     if (t.index === s.current) li.className = 'cur';
     else if (t.index < s.current) li.className = 'past';
-    const img = document.createElement('img'); img.loading = 'lazy'; img.alt = '';
-    const src = safeImg(t.art); if (src) img.src = src;
+    let img;
+    if (!t.art && t.num) {  // Bandcamp: every track shares the album cover, so show its number
+      img = document.createElement('div'); img.className = 'num'; img.textContent = t.num;
+    } else {
+      img = document.createElement('img'); img.loading = 'lazy'; img.alt = '';
+      const src = safeImg(t.art); if (src) img.src = src;
+    }
     const d = document.createElement('div');
     const b = document.createElement('b'); b.textContent = t.title || '…';
     const a = document.createElement('span'); a.textContent = t.artist || '';
@@ -675,6 +709,8 @@ function show(s){
     track = s; at = Date.now();
     document.body.classList.toggle('sc', source() === 'soundcloud');
     document.body.classList.toggle('vlc', source() === 'vlc');
+    document.body.classList.toggle('bc', source() === 'bandcamp');
+    document.body.classList.toggle('hasq', hasQueue() && (s.queue || []).length > 0);
     $('prog').classList.toggle('seek', canSeek());
     renderSources(s.sources || [], s.source);
     $('title').textContent = s.title || '\\u2014';
@@ -684,7 +720,7 @@ function show(s){
     $('like').classList.toggle('on', !!s.liked);
     $('fs').classList.toggle('on', !!s.fullscreen);
     $('hint').textContent = source() === 'system' ? 'Basic mode \u00b7 open SoundCloud in a browser with the userscript for the queue & seeking'
-      : (source() === 'soundcloud' && s.autoplay && s.autoplay !== 'allowed' && !s.playing) ? 'The browser is blocking playback \u00b7 click the SoundCloud tab once, or allow autoplay for soundcloud.com'
+      : (hasQueue() && s.autoplay && s.autoplay !== 'allowed' && !s.playing) ? 'The browser is blocking playback \u00b7 click the ' + s.app + ' tab once, or allow autoplay for ' + s.app.toLowerCase() + '.com'
       : '';
     const src = safeImg(s.art);
     if (src !== artSrc) {  // only refetch the image when the artwork changes
@@ -692,7 +728,7 @@ function show(s){
       if (src) $('cover').src = src.startsWith('/') ? src + '&t=' + encodeURIComponent(T) : src;
       else $('cover').removeAttribute('src');
     }
-    if (source() === 'soundcloud') renderQueue(s);
+    if (hasQueue()) renderQueue(s);
     tick();
   }
   $('err').textContent = s.error || '';
@@ -825,10 +861,13 @@ class Handler(BaseHTTPRequestHandler):
             tab = self._query("tab", "")
             bridge_report(tab, state)
             with bridge:
-                active = active_tab() == tab
-            # Only the active tab keeps a long poll open (browsers allow ~6
-            # connections per host); others get commands with this reply.
-            return self._send(200, json.dumps({"active": active, "cmds": bridge_take(tab)}))
+                active = active_tab(site_of(state)) == tab
+            # Userscript 2.1+ asks us to hold the reply (up to 1s, or until a command
+            # arrives) and then reports again at once: one request per tab, paced
+            # by us rather than by the browser's (throttled) timers. Older
+            # versions get an immediate reply; their active tab long-polls instead.
+            hold = 1.0 if self._query("hold") else 0
+            return self._send(200, json.dumps({"active": active, "cmds": bridge_take(tab, wait=hold)}))
         if not self._authorized():
             return self._send(403, "forbidden", "text/plain")
         cmd = path.removeprefix("/api/")
@@ -849,7 +888,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(status(g)))
         src = self._query("src") or chosen_source(g)  # the player the phone is showing
         try:
-            if src == "soundcloud" and g["tab"] and cmd in BRIDGE_CMDS:
+            tab = g["tabs"].get(src)
+            if tab and cmd in SITE_CMDS[src]:
                 c = {"cmd": cmd}
                 if cmd == "seek":
                     c["pos"] = float(self._query("pos"))
@@ -857,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
                     c["index"] = int(self._query("index"))
                     if self._query("id"):
                         c["id"] = int(self._query("id"))
-                bridge_command(g["tab"], c)
+                bridge_command(tab, c)
             elif src == "vlc" and cmd in VLC_CMDS:
                 if not g["vlc"].get("name"):
                     return self._send(409, json.dumps({"error": "VLC isn't playing anything"}))
@@ -879,8 +919,8 @@ class Handler(BaseHTTPRequestHandler):
                 media_key(NX_KEYTYPE[cmd])
                 time.sleep(0.4)  # let the browser update Now Playing before we report it
             elif cmd in BRIDGE_CMDS or cmd in VLC_CMDS:
-                need = "the SoundCloud userscript" if cmd in BRIDGE_CMDS else "VLC"
-                return self._send(409, json.dumps({"error": f"That needs {need}"}))
+                name = SOURCE_NAMES.get(src, "this player")
+                return self._send(409, json.dumps({"error": f"That isn't available for {name}"}))
             else:
                 return self._send(404, "unknown command", "text/plain")
         except (TypeError, ValueError):
@@ -891,8 +931,9 @@ class Handler(BaseHTTPRequestHandler):
         """The phone's "Stop remote": pause whatever plays (a Mac playing audio
         won't sleep), reply, then end serve_forever() - same as Ctrl+C."""
         g = gather()
-        if g["playing"]["soundcloud"]:
-            bridge_command(g["tab"], {"cmd": "playpause"})
+        for site in BRIDGE_SITES:
+            if g["playing"][site]:
+                bridge_command(g["tabs"][site], {"cmd": "playpause"})
         if g["playing"]["vlc"]:
             vlc("pause")
         if g["playing"]["system"] and AXIsProcessTrusted():
