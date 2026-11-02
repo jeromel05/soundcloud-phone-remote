@@ -277,7 +277,9 @@ def bridge_report(tab: str, state: dict) -> None:
     now = time.time()
     with bridge:
         t = tabs.setdefault(tab, {"since": now, "played": 0, "acked": 0})
-        t["state"], t["seen"] = state, now
+        if state.get("error") and state["error"] != t.get("error"):  # the userscript hit a problem in this tab
+            print(f"!  A {site_of(state)} tab can't read its player: {state['error']}", flush=True)
+        t["state"], t["seen"], t["error"] = state, now, state.get("error")
         if state.get("playing"):
             t["played"] = now
         if isinstance(state.get("ack"), int):
@@ -298,6 +300,17 @@ def active_tab(site: str = "soundcloud"):
     live = [(v["played"], bool(v["state"].get("title")), v["since"], k) for k, v in tabs.items()
             if now - v["seen"] < BRIDGE_STALE and v["state"].get("ready") and site_of(v["state"]) == site]
     return max(live)[-1] if live else None
+
+
+def bridge_debug() -> list:
+    """What every connected tab last said (curl -H 'X-SC-Remote: 1' 127.0.0.1:8765/bridge/debug)."""
+    now = time.time()
+    with bridge:
+        return [{"tab": k, "site": site_of(v["state"]), "ready": v["state"].get("ready"), "error": v["state"].get("error"),
+                 "title": v["state"].get("title"), "doc": v["state"].get("doc"), "playing": v["state"].get("playing"),
+                 "current": v["state"].get("current"), "queueLength": v["state"].get("queueLength"),
+                 "seen_ago": round(now - v["seen"], 1), "played_ago": round(now - v["played"], 1) if v["played"] else None,
+                 "connected_for": round(now - v["since"])} for k, v in tabs.items()]
 
 
 def bridge_command(tab: str, cmd: dict) -> None:
@@ -835,6 +848,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._from_userscript():
                 return self._send(403, "forbidden", "text/plain")
             return self._send(200, json.dumps(bridge_take(self._query("tab", ""), wait=20)))
+        if path == "/bridge/debug":
+            if not self._from_userscript():
+                return self._send(403, "forbidden", "text/plain")
+            return self._send(200, json.dumps(bridge_debug(), indent=1))
         if not self._authorized():
             return self._send(403, "forbidden", "text/plain")
         if path == "/":
