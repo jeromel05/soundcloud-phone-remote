@@ -259,6 +259,7 @@ def system_status() -> dict:
 # Now Playing.
 USERSCRIPT = Path(__file__).with_name("sc_remote.user.js")
 BRIDGE_STALE = 8          # seconds without a report before a tab counts as gone
+TITLE_LINGER = 6          # seconds a tab's old title still counts as that tab's
 SITE_CMDS = {"soundcloud": ("playpause", "next", "prev", "seek", "play", "like"),
              "bandcamp": ("playpause", "next", "prev", "seek", "play")}
 BRIDGE_SITES = tuple(SITE_CMDS)
@@ -279,6 +280,12 @@ def bridge_report(tab: str, state: dict) -> None:
         t = tabs.setdefault(tab, {"since": now, "played": 0, "acked": 0})
         if state.get("error") and state["error"] != t.get("error"):  # the userscript hit a problem in this tab
             print(f"!  A {site_of(state)} tab can't read its player: {state['error']}", flush=True)
+        was = t.setdefault("was", {})  # titles it just left: Now Playing can still show them for a moment
+        for x in (t.get("state", {}).get(k) for k in ("title", "doc")):
+            if x and x not in (state.get("title"), state.get("doc")):
+                was[x] = now
+        for x in [x for x, at in was.items() if now - at > TITLE_LINGER]:
+            del was[x]
         t["state"], t["seen"], t["error"] = state, now, state.get("error")
         if state.get("playing"):
             t["played"] = now
@@ -434,24 +441,90 @@ def same_title(t) -> str:
     return re.sub(r"^[\u25B6\u25BA\uFE0E\uFE0F\s]+", "", t or "").strip().lower()  # Chrome prefixes "▶︎" while playing
 
 
-def gather() -> dict:
-    """Look at every source once: {"tabs", "vlc", "system", "avail": [...], ...}."""
+# VLC and Now Playing cost an osascript call each, about 0.4s together, which no
+# tap should have to wait for. Requests use the last answers and refresh them in
+# the background, so nothing runs while the phone isn't asking.
+SLOW_FRESH = 2.5          # refresh answers older than this in the background...
+SLOW_MAX = 10             # ...but wait for new ones past this: the phone was away
+slow = {"at": 0, "touched": 0, "vlc": {}, "vlc_at": 0, "system": {}, "system_at": 0}
+slow_data = threading.Lock()  # guards `slow`
+slow_busy = threading.Lock()  # one refresh at a time
+volume_lock = threading.Lock()  # keeps quick volume taps in order
+
+
+def refresh_slow() -> None:
+    """Ask VLC and Now Playing right now. Call with slow_busy held."""
+    t0 = time.time()
+    got = {}
+    th = threading.Thread(target=lambda: got.update(vlc=vlc()))
+    th.start()
+    sysst = system_status()
+    th.join()
+    t1 = time.time()
+    mid = (t0 + t1) / 2
+    with slow_data:
+        if slow["touched"] < t0:  # otherwise a command got in between; this answer may predate it
+            slow.update(at=t1, vlc=got.get("vlc", {}), vlc_at=mid, system=sysst, system_at=mid)
+
+
+def refresh_in_background() -> None:
+    try:
+        refresh_slow()
+    finally:
+        slow_busy.release()
+
+
+def slow_sources(fresh: bool = False) -> tuple:
+    """(VLC's state, Now Playing's state), both moved on to the present."""
+    with slow_data:
+        age = time.time() - slow["at"]
+    if fresh or age > SLOW_MAX:
+        with slow_busy:
+            with slow_data:
+                age = time.time() - slow["at"]
+            if fresh or age > SLOW_MAX:  # someone else may have just done it
+                refresh_slow()
+    elif age > SLOW_FRESH and slow_busy.acquire(blocking=False):
+        threading.Thread(target=refresh_in_background, daemon=True).start()
+    now = time.time()
+    out = []
+    with slow_data:
+        for name in ("vlc", "system"):
+            x = dict(slow[name])
+            if x.get("playing") and x.get("position") is not None:
+                x["position"] = min(x.get("duration") or 1e9, x["position"] + now - slow[name + "_at"])
+            out.append(x)
+    return tuple(out)
+
+
+def remember_vlc(v: dict) -> None:
+    """A VLC command returned its new state."""
+    now = time.time()
+    with slow_data:
+        slow.update(vlc=v, vlc_at=now, touched=now)
+
+
+def remember_volume(volume: int) -> None:
+    with slow_data:
+        slow["touched"] = time.time()
+        for name in ("vlc", "system"):
+            slow[name] = dict(slow[name], volume=volume)
+
+
+def gather(fresh: bool = False) -> dict:
+    """Look at every source once: {"tabs", "vlc", "system", "avail": [...], ...}.
+    Fresh waits for new answers from VLC and Now Playing, for when they must be current."""
+    v, sysst = slow_sources(fresh)
     now = time.time()
     with bridge:
         site_tabs = {site: active_tab(site) for site in BRIDGE_SITES}
         site_playing = {site: bool(t) and bool(tabs[t]["state"].get("playing")) for site, t in site_tabs.items()}
         # what the userscript tabs show, to recognise them again in macOS Now Playing
         known = {same_title(x) for v in tabs.values() if now - v["seen"] < BRIDGE_STALE
-                 for x in (v["state"].get("title"), v["state"].get("doc")) if x}
-    # each osascript call costs ~0.15s, so ask VLC and Now Playing at the same time
-    got = {}
-    th = threading.Thread(target=lambda: got.update(vlc=vlc()))
-    th.start()
-    sysst = system_status()  # anything else that's playing (or SoundCloud without the userscript)
-    th.join()
-    v = got["vlc"]
+                 for x in (v["state"].get("title"), v["state"].get("doc"), *v.get("was", ())) if x}
     has_vlc = bool(v.get("name"))
     volume = v.get("volume") if isinstance(v.get("volume"), int) else sysst.get("volume")
+    raw = sysst  # anything else that's playing (or SoundCloud without the userscript)
     if sysst.get("app") == "VLC" or not sysst.get("title") or same_title(sysst["title"]) in known:
         sysst = None  # already covered by VLC's or a userscript tab's own entry
     avail = [s for s in BRIDGE_SITES if site_tabs[s]]
@@ -461,7 +534,7 @@ def gather() -> dict:
             note_playing("vlc", v.get("playing"))
         if sysst:
             note_playing("system", sysst.get("playing"))
-    return {"tab": site_tabs["soundcloud"], "tabs": site_tabs, "vlc": v, "system": sysst, "avail": avail,
+    return {"tab": site_tabs["soundcloud"], "tabs": site_tabs, "vlc": v, "system": sysst, "raw": raw, "avail": avail,
             "volume": volume, "playing": dict(site_playing, vlc=bool(v.get("playing")),
                                               system=bool(sysst and sysst.get("playing")))}
 
@@ -483,7 +556,7 @@ def status(g=None) -> dict:
     elif src == "vlc":
         s = vlc_status(g["vlc"])
     else:
-        s = g["system"] or system_status()
+        s = g["system"] or g["raw"]
         src = "system"
     s["volume"] = g["volume"]
     s["source"] = src
@@ -664,6 +737,8 @@ const T = new URLSearchParams(location.search).get('t') || '';
 const $ = id => document.getElementById(id);
 const PLAY = 'M8 5v14l11-7z', PAUSE = 'M6 5h4v14H6zm8 0h4v14h-4z';
 let track = null, at = 0, artSrc, queueKey, dragging = null;  // last status + local time it was received
+let epoch = 0, acting = 0;  // bumped by each tap, and how many taps await their answer
+const last = {};            // source -> {s: its last status, at: when}
 const fmt = s => {
   s = Math.max(0, Math.floor(s || 0));
   const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, pad = n => String(n).padStart(2, '0');
@@ -723,6 +798,7 @@ function show(s){
   if (s.volume != null) $('vol').textContent = s.volume + '%';
   if ('title' in s) {
     track = s; at = Date.now();
+    if (s.source) last[s.source] = {s, at};
     document.body.classList.toggle('sc', source() === 'soundcloud');
     document.body.classList.toggle('vlc', source() === 'vlc');
     document.body.classList.toggle('bc', source() === 'bandcamp');
@@ -753,12 +829,17 @@ function show(s){
 async function call(path, opts, params){
   // give up after 5s: a sleeping Mac never answers, and hung requests would pile up
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 5000);
+  const tap = !!opts;
+  if (tap) { epoch++; acting++; }
+  const mine = epoch;
   try {
     const r = await fetch(path + '?t=' + encodeURIComponent(T) + (params ? '&' + params : ''), Object.assign({signal: ctl.signal}, opts));
     if (r.status === 403) return $('err').textContent = 'Bad link - rescan the QR code';
-    show(await r.json());  // clears the message below once the Mac is back
-  } catch(e){ $('err').textContent = 'Can\u2019t reach the Mac (asleep?) \u00b7 retrying\u2026'; }
-  finally { clearTimeout(timer); }
+    const s = await r.json();
+    if (mine !== epoch || (!tap && acting)) return;  // asked before the latest tap: don't let it undo that
+    show(s);  // clears the message below once the Mac is back
+  } catch(e){ if (mine === epoch) $('err').textContent = 'Can\u2019t reach the Mac (asleep?) \u00b7 retrying\u2026'; }
+  finally { clearTimeout(timer); if (tap) acting--; }
 }
 function renderSources(list, cur){
   const key = JSON.stringify([cur, list]);
@@ -771,15 +852,22 @@ function renderSources(list, cur){
     b.textContent = x.name;
     b.className = (x.id === cur ? 'on ' : '') + (x.playing ? 'playing' : '');
     b.dataset.id = x.id;  // per-player colour
-    b.onclick = () => { if (navigator.vibrate) navigator.vibrate(10); call('/api/select', {method:'POST'}, 'src=' + encodeURIComponent(x.id)); };
+    b.onclick = () => { if (navigator.vibrate) navigator.vibrate(10); preview(x); call('/api/select', {method:'POST'}, 'src=' + encodeURIComponent(x.id)); };
     nav.append(b);
   }
+}
+function preview(x){  // switch at once to what we last saw from that player; the answer corrects it
+  const l = last[x.id];
+  if (!l) return renderSources(track.sources, x.id);
+  const position = l.s.position != null && l.s.playing ? l.s.position + (Date.now() - l.at) / 1000 : l.s.position;
+  show(Object.assign({}, l.s, {source: x.id, sources: track.sources, playing: x.playing, position}));
 }
 function send(cmd, params){
   if (navigator.vibrate) navigator.vibrate(10);
   // tag every command with the player on screen, so it can't hit the other one
   if (track && track.source) params = (params ? params + '&' : '') + 'src=' + encodeURIComponent(track.source);
   if (cmd === 'like') $('like').classList.toggle('on');
+  if (cmd === 'volup' || cmd === 'voldown') { const v = parseInt($('vol').textContent); if (v >= 0) $('vol').textContent = Math.max(0, Math.min(100, v + (cmd === 'volup' ? 6 : -6))) + '%'; }
   if (cmd === 'skip' && track) { track.position = Math.max(0, position() + parseFloat(params.split('by=')[1])); at = Date.now(); tick(); }
   if (cmd === 'playpause' && track) { track.position = position(); at = Date.now(); track.playing = !track.playing; $('pp').setAttribute('d', track.playing ? PAUSE : PLAY); }
   call('/api/' + cmd, {method:'POST'}, params);
@@ -806,7 +894,7 @@ $('prog').addEventListener('pointercancel', () => { dragging = null; tick(); });
 let stopped = false;
 let polling = false;
 const poll = async () => { if (stopped || polling) return; polling = true; await call('/api/status'); polling = false; };
-poll(); setInterval(poll, 3000); setInterval(tick, 500);
+poll(); setInterval(poll, 1000); setInterval(tick, 500);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 async function stopRemote(){
   if (!confirm('Stop the remote? The music will be paused so the Mac can go to sleep.')) return;
@@ -895,9 +983,14 @@ class Handler(BaseHTTPRequestHandler):
         if cmd == "shutdown":
             return self._shutdown()
         if cmd in ("volup", "voldown"):
-            v = get_volume()
-            if v is not None:
-                set_volume(v + (6 if cmd == "volup" else -6))
+            with volume_lock:
+                v = gather()["volume"]
+                if v is None:
+                    v = get_volume()
+                if v is not None:
+                    v = max(0, min(100, v + (6 if cmd == "volup" else -6)))
+                    set_volume(v)
+                    remember_volume(v)
             return self._send(200, json.dumps(status()))
         g = gather()
         if cmd == "select":  # the phone's player switcher
@@ -930,6 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
                     arg = str(round(max(-600.0, min(600.0, float(self._query("by"))))))
                 v = vlc(cmd, arg)  # returns VLC's new state; no need to look again
                 if v.get("name"):
+                    remember_vlc(v)
                     g["vlc"], g["playing"]["vlc"] = v, bool(v.get("playing"))
                     with bridge:
                         note_playing("vlc", v.get("playing"))
@@ -946,12 +1040,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, "unknown command", "text/plain")
         except (TypeError, ValueError):
             return self._send(400, json.dumps({"error": "bad parameters"}))
-        self._send(200, json.dumps(status()))
+        self._send(200, json.dumps(status(gather(fresh=not tab))))  # a userscript tab has already reported back
 
     def _shutdown(self):
         """The phone's "Stop remote": pause whatever plays (a Mac playing audio
         won't sleep), reply, then end serve_forever() - same as Ctrl+C."""
-        g = gather()
+        g = gather(fresh=True)
         for site in BRIDGE_SITES:
             if g["playing"][site]:
                 bridge_command(g["tabs"][site], {"cmd": "playpause"})
