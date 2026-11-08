@@ -8,6 +8,8 @@ your phone (same Wi-Fi) by scanning the QR code printed in the terminal.
 - Play/pause, next, previous, Mac volume
 - With the userscript: SoundCloud's **Next up** queue (tap a track to play it),
   tap/drag to seek, and like/unlike
+- **Embedded SoundCloud players** on other sites count as SoundCloud too, once
+  you've pressed play in them (no likes there: the embed isn't signed in)
 - **Bandcamp** (with the userscript): track, artist, cover, seeking, and the
   album's track list on album pages; the bottom player on collection pages works too
 - **VLC**: movie title, seekable progress bar, −10 s / +10 s, play/pause, fullscreen
@@ -52,7 +54,7 @@ One script covers SoundCloud and Bandcamp; install it in each browser you use th
    **Allow User Scripts**.
 2. With the remote running, open <http://127.0.0.1:8765/sc-remote.user.js> in
    that browser and click **Install** (or **Update**).
-3. Reload your SoundCloud / Bandcamp tabs.
+3. Reload your SoundCloud / Bandcamp tabs (and pages with embedded SoundCloud players).
 4. Allow autoplay for the site (Firefox: lock icon → Permissions → Autoplay →
    Allow Audio and Video; Chrome: lock icon → Site settings → Sound → Allow).
    Otherwise the browser refuses to start playback from the remote until you've
@@ -63,8 +65,11 @@ One script covers SoundCloud and Bandcamp; install it in each browser you use th
 **Full mode** (userscript installed, SoundCloud or Bandcamp tab open): on SoundCloud
 the userscript reaches the internal play manager inside the page; on Bandcamp it
 uses the page's player and track list. Either way it reports the player state to
-the server every second and runs commands from the phone. Only the tab being
-controlled holds a long-poll connection open, so taps act within about half a second.
+the server every second and runs commands from the phone. The server holds each
+report's reply until a command arrives (or a second passes), so taps act at once.
+In SoundCloud's embedded player (`w.soundcloud.com` iframes) the script talks to
+the embed's own, simpler play manager; an embed joins only after it has played,
+so a page full of embeds doesn't flood the remote.
 
 **Basic mode** (no userscript, or no SoundCloud tab): buttons send macOS media
 keys, and "Now playing" comes from macOS's system-wide Now Playing info, the

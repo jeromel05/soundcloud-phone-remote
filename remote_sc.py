@@ -282,6 +282,8 @@ def bridge_report(tab: str, state: dict) -> None:
         t["state"], t["seen"], t["error"] = state, now, state.get("error")
         if state.get("playing"):
             t["played"] = now
+        elif isinstance(state.get("playedAt"), (int, float)):  # played before we (re)started
+            t["played"] = max(t["played"], min(now, state["playedAt"]))
         if isinstance(state.get("ack"), int):
             t["acked"] = max(t["acked"], state["ack"])
         for k in [k for k, v in tabs.items() if now - v["seen"] > 60]:
@@ -339,7 +341,7 @@ def bridge_status(tab: str) -> dict:
         s, seen = dict(t["state"]), t["seen"]
     if s.get("playing") and s.get("position") is not None:
         s["position"] = min(s.get("duration") or 1e9, s["position"] + time.time() - seen)
-    for k in ("ack", "ready", "error", "doc", "site"):
+    for k in ("ack", "ready", "error", "doc", "site", "playedAt"):
         s.pop(k, None)
     s.setdefault("title", "")  # nothing loaded yet
     s["app"] = SOURCE_NAMES[site_of(t["state"])]
@@ -569,6 +571,7 @@ svg{position:relative;width:32px;height:32px;fill:currentColor;filter:drop-shado
 #fs.on{color:var(--acc2)}
 .sc #like,.vlc #fs{display:grid}
 .sc .vol::after,.vlc .vol::after{content:"";width:min(56px,7.5svh)}  /* balances the like/fullscreen button */
+.sc.nolike #like,.sc.nolike .vol::after{display:none}  /* SoundCloud's embedded player can't like */
 #back,#fwd{display:none}
 .vlc #back,.vlc #fwd{display:grid}
 .vlc #prev,.vlc #next{display:none}
@@ -731,6 +734,7 @@ function show(s){
     $('src').textContent = s.app ? 'Now playing \\u00b7 ' + s.app : 'Now playing';
     $('pp').setAttribute('d', s.playing ? PAUSE : PLAY);
     $('like').classList.toggle('on', !!s.liked);
+    document.body.classList.toggle('nolike', s.liked === null);
     $('fs').classList.toggle('on', !!s.fullscreen);
     $('hint').textContent = source() === 'system' ? 'Basic mode \u00b7 open SoundCloud in a browser with the userscript for the queue & seeking'
       : (hasQueue() && s.autoplay && s.autoplay !== 'allowed' && !s.playing) ? 'The browser is blocking playback \u00b7 click the ' + s.app + ' tab once, or allow autoplay for ' + s.app.toLowerCase() + '.com'

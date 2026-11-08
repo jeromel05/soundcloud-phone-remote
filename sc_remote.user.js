@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         SC Remote bridge
 // @namespace    sc-remote.local
-// @version      2.1
+// @version      2.2
 // @description  Lets remote_sc.py show SoundCloud and Bandcamp on your phone and control playback.
 // @match        https://soundcloud.com/*
+// @match        https://w.soundcloud.com/player/*
 // @match        https://bandcamp.com/*
 // @match        https://*.bandcamp.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
-// @noframes
 // @updateURL    http://127.0.0.1:__PORT__/sc-remote.user.js
 // @downloadURL  http://127.0.0.1:__PORT__/sc-remote.user.js
 // ==/UserScript==
@@ -18,6 +18,8 @@
  * Three parts:
  *  - pageMain() runs inside the SoundCloud page itself (injected <script>), where it
  *    can reach SoundCloud's internal play manager. It reports state and runs commands.
+ *    It also covers SoundCloud's embedded player (w.soundcloud.com iframes on other
+ *    sites), which has a simpler play manager of its own.
  *  - bandcampMain() does the same on Bandcamp, where the page's own DOM (player
  *    buttons, track list, <audio>) is all it needs.
  *  - The rest runs in the userscript sandbox and relays between the page and the
@@ -29,6 +31,11 @@
 function pageMain() {
   'use strict';
   let req = null, pm = null;
+  const WIDGET = location.hostname === 'w.soundcloud.com';  // the embedded player
+  const isMain = e => typeof e.toggleCurrent === 'function' && typeof e.getQueue === 'function'
+    && typeof e.setCurrentItem === 'function' && typeof e.getCurrentSound === 'function';
+  const isWidget = e => typeof e.getSounds === 'function' && typeof e.getCurrentSound === 'function'
+    && typeof e.toggle === 'function' && typeof e.playNext === 'function';
 
   // SoundCloud is a webpack app; borrow its module require to find the play manager.
   function playManager() {
@@ -41,10 +48,7 @@ function pageMain() {
     if (!req || !req.c) return null;
     for (const m of Object.values(req.c)) {
       for (const e of [m && m.exports, m && m.exports && m.exports.default]) {
-        if (e && typeof e.toggleCurrent === 'function' && typeof e.getQueue === 'function'
-            && typeof e.setCurrentItem === 'function' && typeof e.getCurrentSound === 'function') {
-          return (pm = e);
-        }
+        if (e && (WIDGET ? isWidget(e) : isMain(e))) return (pm = e);
       }
     }
     return null;
@@ -68,9 +72,48 @@ function pageMain() {
     };
   }
 
+  const autoplay = () => (navigator.getAutoplayPolicy ? navigator.getAutoplayPolicy('mediaelement') : null);
+  const soundId = x => (x.attributes || {}).id || x.id;
+
+  // The embedded player: one track or playlist, no "Next up" beyond it, and no
+  // likes (it isn't signed in to SoundCloud).
+  function widgetState(p) {
+    const sounds = Array.from(p.getSounds() || []), sound = p.getCurrentSound();
+    const current = sounds.indexOf(sound), start = Math.max(0, current - 3);
+    const s = {
+      ready: true,
+      playing: !!p.isPlaying(),
+      autoplay: autoplay(),
+      current,
+      queueLength: sounds.length,
+      queue: sounds.slice(start, start + 60).map((it, k) => Object.assign(track(it), { index: start + k })),
+      liked: null,
+    };
+    if (sound) Object.assign(s, track(sound), { art: artwork(sound.attributes || {}, 't500x500'), position: sound.currentTime() / 1000 });
+    return s;
+  }
+
+  function widgetRun(p, c) {
+    const opts = { userAction: true };
+    const sounds = Array.from(p.getSounds() || []), sound = p.getCurrentSound();
+    if (c.cmd === 'playpause') p.toggle(sound, opts);
+    else if (c.cmd === 'next') p.playNext();
+    else if (c.cmd === 'prev') {
+      // a single mix has nothing before it: back to the start, like SoundCloud's own button
+      if (sound && (sounds.indexOf(sound) <= 0 || sound.currentTime() > 3000)) sound.seek(0);
+      else p.playPrev();
+    } else if (c.cmd === 'seek') { if (sound) sound.seek(Math.max(0, c.pos * 1000)); }
+    else if (c.cmd === 'play') {
+      let item = sounds[c.index];
+      if (!item || (c.id && soundId(item) !== c.id)) item = sounds.find(x => soundId(x) === c.id);
+      if (item) p.play(item, opts);
+    }
+  }
+
   function state() {
     const p = playManager();
     if (!p) return { ready: false };
+    if (WIDGET) return widgetState(p);
     const models = (p.getQueue() || {}).models || [];
     const current = models.indexOf(p.getCurrentQueueItem());
     const start = Math.max(0, current - 3);
@@ -79,7 +122,7 @@ function pageMain() {
       playing: p.isPlaying(),
       // "allowed" once the tab was clicked or autoplay is permitted for the site;
       // otherwise the browser refuses to start audio from our commands
-      autoplay: navigator.getAutoplayPolicy ? navigator.getAutoplayPolicy('mediaelement') : null,
+      autoplay: autoplay(),
       current,
       queueLength: models.length,
       queue: models.slice(start, start + 60).map((it, k) => Object.assign(track(it.sound), { index: start + k })),
@@ -99,6 +142,7 @@ function pageMain() {
   function run(c) {
     const p = playManager();
     if (!p) return;
+    if (WIDGET) return widgetRun(p, c);
     const opts = { userInitiated: true };
     if (c.cmd === 'playpause') p.toggleCurrent(opts);
     else if (c.cmd === 'next') p.playNext(opts);
@@ -271,7 +315,8 @@ function bandcampMain() {
 
 (function () {
   'use strict';
-  if (window.top !== window) return;  // only the main page, never ad/login iframes
+  const WIDGET = location.hostname === 'w.soundcloud.com';  // SoundCloud's player embedded in another site
+  if (window.top !== window && !WIDGET) return;  // only the main page, never ad/login iframes
   const SITE = /(^|\.)bandcamp\.com$/.test(location.hostname) ? 'bandcamp' : 'soundcloud';
   const SERVER = 'http://127.0.0.1:__PORT__';
   const TAB = Math.random().toString(36).slice(2, 10);
@@ -295,6 +340,7 @@ function bandcampMain() {
     for (const c of cmds || []) document.dispatchEvent(new CustomEvent('scremote-cmd', { detail: JSON.stringify(c) }));
   }
   const parse = r => { try { return JSON.parse(r); } catch (e) { return null; } };
+  let playedAt = 0;  // when this page last played, so a restarted server knows which tab was in use
 
   // Ask the site module for its state right now (DOM events run synchronously,
   // even between the page and the userscript sandbox).
@@ -305,6 +351,8 @@ function bandcampMain() {
     document.dispatchEvent(new CustomEvent('scremote-poke'));
     document.removeEventListener('scremote-state', grab);
     const s = parse(st) || { ready: false };  // module not loaded yet
+    if (s.playing) playedAt = Date.now() / 1000;
+    s.playedAt = playedAt;
     s.site = SITE;
     s.doc = document.title.replace(/^[▶►︎️\s]+/, '');  // lets the server spot this tab in macOS Now Playing
     return JSON.stringify(s);
@@ -337,5 +385,10 @@ function bandcampMain() {
     (document.head || document.documentElement).appendChild(s);
     s.remove();
   }
-  loop();
+  if (WIDGET) {
+    // a page can embed dozens of players; only one that has played joins the remote
+    (async () => { while (!parse(snapshot()).playing) await sleep(1000); loop(); })();
+  } else {
+    loop();
+  }
 })();
